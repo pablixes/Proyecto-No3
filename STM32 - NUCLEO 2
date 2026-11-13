@@ -1,0 +1,1690 @@
+*
+ * NUCLEO 2 FINAL - STM32F446RE
+ * STM32CubeMX: I2C1 PB8/PB9, SPI1 PA5/PA6/PA7,
+ * USART1 PA9/PA10 + NVIC, USART2 PA2/PA3 para Hercules,
+ * TFT CS PB0, DC PA4, RESET PC1; SD CS PB6.
+ * Middleware: FATFS -> User-defined.
+ * Sustituir FATFS/Target/user_diskio.c por el driver del paquete.
+ */
+/* USER CODE BEGIN Header */
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Nucleo 2 - Incubadora neonatal
+ *
+ * PARTE 1: Sensor AHT10 por I2C1
+ * PARTE 2: Comunicacion UART1 con Nucleo 1
+ * PARTE 3: Pantalla TFT ILI9341 por SPI1
+ * PARTE 4: Prueba del AHT10 con Hercules por USART2
+ *
+ * USART1: PA9 TX / PA10 RX - Nucleo 1
+ * USART2: PA2 TX / PA3 RX - Hercules
+ *
+ * El sensor se lee automaticamente cada 2 segundos.
+ * Los resultados se muestran en Hercules.
+ ******************************************************************************
+ */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "fatfs.h"   // Habilitar Middleware FatFs -> User-defined en CubeMX
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN PD */
+
+#define AHT10_ADDR       (0x38 << 1)
+
+#define TFT_ANCHO        320
+#define TFT_ALTO         240
+
+// Colores originales RGB565
+#define COLOR_FONDO      0xDFFF
+#define COLOR_BLANCO     0xFFFF
+#define COLOR_AZUL       0x10A5
+#define COLOR_CELESTE    0x9E7F
+#define COLOR_TEXTO      0x194A
+#define COLOR_VERDE      0x054F
+#define COLOR_ROJO       0xF9E7
+#define COLOR_GRIS       0x8410
+
+#define TEMP_MIN         36.0f
+#define TEMP_MAX         37.5f
+#define HUM_MIN          40.0f
+#define HUM_MAX          60.0f
+
+#define UART_RX_BUFFER_SIZE 256
+
+// Intervalo de lectura para Hercules: 2 segundos
+#define INTERVALO_SENSOR_MS 2000
+#define AUTO_HERCULES 0   // 0 = solo leer al recibir READ (rubrica); 1 = diagnostico continuo
+
+/* USER CODE END PD */
+
+/* USER CODE BEGIN PM */
+
+// Compatibilidad con nombres de CubeMX
+#if defined(LCD_RESET_Pin)
+#define TFT_RST_Pin         LCD_RESET_Pin
+#define TFT_RST_GPIO_Port   LCD_RESET_GPIO_Port
+#elif defined(RESET_Pin)
+#define TFT_RST_Pin         RESET_Pin
+#define TFT_RST_GPIO_Port   RESET_GPIO_Port
+#endif
+
+#if defined(LCD_DC_Pin)
+#define TFT_DC_Pin          LCD_DC_Pin
+#define TFT_DC_GPIO_Port    LCD_DC_GPIO_Port
+#elif defined(DC_Pin)
+#define TFT_DC_Pin          DC_Pin
+#define TFT_DC_GPIO_Port    DC_GPIO_Port
+#endif
+
+#if defined(LCD_CS_Pin)
+#define TFT_CS_Pin          LCD_CS_Pin
+#define TFT_CS_GPIO_Port    LCD_CS_GPIO_Port
+#elif defined(CS_Pin)
+#define TFT_CS_Pin          CS_Pin
+#define TFT_CS_GPIO_Port    CS_GPIO_Port
+#endif
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+I2C_HandleTypeDef hi2c1;
+SPI_HandleTypeDef hspi1;
+
+// USART1: Nucleo 1
+UART_HandleTypeDef huart1;
+
+// USART2: Hercules
+UART_HandleTypeDef huart2;
+
+/* USER CODE BEGIN PV */
+
+// ============================================================
+// PARTE 1: VARIABLES DEL SENSOR AHT10
+// ============================================================
+
+float temperatura = 0.0f;
+float humedad = 0.0f;
+
+uint8_t sensorDisponible = 0;
+uint8_t medicionValida = 0;
+
+int32_t temperatura10 = 0;
+int32_t humedad10 = 0;
+
+// ============================================================
+// PARTE 2: VARIABLES UART CON NUCLEO 1
+// ============================================================
+
+char comandoUART[32];
+uint8_t posicionUART = 0;
+
+char mensajeUART[120];
+
+static uint8_t uartRxByte = 0;
+
+static volatile uint8_t uartRxBuffer[UART_RX_BUFFER_SIZE];
+static volatile uint16_t uartRxHead = 0;
+static volatile uint16_t uartRxTail = 0;
+
+static volatile uint8_t uartOverflow = 0;
+static volatile uint8_t uartError = 0;
+
+// ============================================================
+// PARTE 4: VARIABLES HERCULES
+// ============================================================
+
+static uint32_t tiempoAnteriorSensor = 0;
+
+static char mensajeHercules[160];
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+
+static void AHT10_Init(void);
+static uint8_t AHT10_Leer(void);
+
+static void TFT_Init(void);
+static void TFT_PantallaInicial(void);
+static void TFT_ActualizarDatos(void);
+
+static void UART_Enviar(const char *texto);
+static void UART_ProcesarComando(const char *comando);
+static void UART_Revisar(void);
+static void UART_IniciarRecepcion(void);
+
+static void Hercules_Enviar(const char *texto);
+static void Hercules_ProbarSensor(void);
+
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+
+// ============================================================
+// PARTE 4: ENVIAR INFORMACION A HERCULES
+// ============================================================
+
+// USART2 conectado al ST-LINK Virtual COM Port
+static void Hercules_Enviar(const char *texto)
+{
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)texto,
+        (uint16_t)strlen(texto),
+        1000
+    );
+}
+
+// ============================================================
+// PARTE 2: UART1 CON NUCLEO 1
+// ============================================================
+
+// Activar recepcion por interrupciones
+static void UART_IniciarRecepcion(void)
+{
+    HAL_UART_Receive_IT(
+        &huart1,
+        &uartRxByte,
+        1
+    );
+}
+
+// Interrupcion cuando llega un caracter desde Nucleo 1
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        uint16_t siguiente =
+            (uint16_t)((uartRxHead + 1U) %
+                       UART_RX_BUFFER_SIZE);
+
+        if (siguiente != uartRxTail)
+        {
+            uartRxBuffer[uartRxHead] = uartRxByte;
+            uartRxHead = siguiente;
+        }
+        else
+        {
+            uartOverflow = 1;
+        }
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &uartRxByte,
+            1
+        );
+    }
+}
+
+// Recuperacion ante errores UART
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        uartError = 1;
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &uartRxByte,
+            1
+        );
+    }
+}
+
+// Obtener caracter almacenado
+static uint8_t UART_ObtenerByte(uint8_t *dato)
+{
+    if (uartRxTail == uartRxHead)
+    {
+        return 0;
+    }
+
+    *dato = uartRxBuffer[uartRxTail];
+
+    uartRxTail =
+        (uint16_t)((uartRxTail + 1U) %
+                   UART_RX_BUFFER_SIZE);
+
+    return 1;
+}
+
+// Enviar mensaje a Nucleo 1
+static void UART_Enviar(const char *texto)
+{
+    HAL_UART_Transmit(
+        &huart1,
+        (uint8_t *)texto,
+        (uint16_t)strlen(texto),
+        500
+    );
+}
+
+// ============================================================
+// PARTE 3: FUNCIONES DE PANTALLA TFT ILI9341
+// ============================================================
+
+static void TFT_Comando(uint8_t comando)
+{
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_SPI_Transmit(
+        &hspi1,
+        &comando,
+        1,
+        100
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+static void TFT_Datos(
+    const uint8_t *datos,
+    uint16_t cantidad
+)
+{
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_SPI_Transmit(
+        &hspi1,
+        (uint8_t *)datos,
+        cantidad,
+        100
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+static void TFT_Dato(uint8_t dato)
+{
+    TFT_Datos(&dato, 1);
+}
+
+static void TFT_Ventana(
+    uint16_t x0,
+    uint16_t y0,
+    uint16_t x1,
+    uint16_t y1
+)
+{
+    uint8_t datos[4];
+
+    TFT_Comando(0x2A);
+
+    datos[0] = x0 >> 8;
+    datos[1] = x0 & 0xFF;
+    datos[2] = x1 >> 8;
+    datos[3] = x1 & 0xFF;
+
+    TFT_Datos(datos, 4);
+
+    TFT_Comando(0x2B);
+
+    datos[0] = y0 >> 8;
+    datos[1] = y0 & 0xFF;
+    datos[2] = y1 >> 8;
+    datos[3] = y1 & 0xFF;
+
+    TFT_Datos(datos, 4);
+
+    TFT_Comando(0x2C);
+}
+
+// Dibujar rectangulos
+static void TFT_Rectangulo(
+    uint16_t x,
+    uint16_t y,
+    uint16_t ancho,
+    uint16_t alto,
+    uint16_t color
+)
+{
+    if (x >= TFT_ANCHO || y >= TFT_ALTO)
+    {
+        return;
+    }
+
+    if (x + ancho > TFT_ANCHO)
+    {
+        ancho = TFT_ANCHO - x;
+    }
+
+    if (y + alto > TFT_ALTO)
+    {
+        alto = TFT_ALTO - y;
+    }
+
+    if (ancho == 0 || alto == 0)
+    {
+        return;
+    }
+
+    TFT_Ventana(
+        x,
+        y,
+        x + ancho - 1,
+        y + alto - 1
+    );
+
+    uint8_t buffer[128];
+
+    for (uint16_t i = 0; i < 64; i++)
+    {
+        buffer[2 * i] = color >> 8;
+        buffer[2 * i + 1] = color & 0xFF;
+    }
+
+    uint32_t pixeles =
+        (uint32_t)ancho * alto;
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_SET
+    );
+
+    while (pixeles > 0)
+    {
+        uint16_t bloque =
+            (pixeles > 64) ? 64 : (uint16_t)pixeles;
+
+        HAL_SPI_Transmit(
+            &hspi1,
+            buffer,
+            bloque * 2,
+            1000
+        );
+
+        pixeles -= bloque;
+    }
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+// ============================================================
+// LETRAS 5x7 DE LA PANTALLA ORIGINAL
+// ============================================================
+
+static void TFT_ObtenerLetra(
+    char letra,
+    uint8_t columnas[5]
+)
+{
+    const uint8_t vacio[5] = {0,0,0,0,0};
+
+    memcpy(columnas, vacio, 5);
+
+    switch (letra)
+    {
+        case 'A': {uint8_t a[5]={0x7E,0x11,0x11,0x11,0x7E}; memcpy(columnas,a,5); break;}
+        case 'B': {uint8_t a[5]={0x7F,0x49,0x49,0x49,0x36}; memcpy(columnas,a,5); break;}
+        case 'C': {uint8_t a[5]={0x3E,0x41,0x41,0x41,0x22}; memcpy(columnas,a,5); break;}
+        case 'D': {uint8_t a[5]={0x7F,0x41,0x41,0x22,0x1C}; memcpy(columnas,a,5); break;}
+        case 'E': {uint8_t a[5]={0x7F,0x49,0x49,0x49,0x41}; memcpy(columnas,a,5); break;}
+        case 'F': {uint8_t a[5]={0x7F,0x09,0x09,0x09,0x01}; memcpy(columnas,a,5); break;}
+        case 'G': {uint8_t a[5]={0x3E,0x41,0x49,0x49,0x7A}; memcpy(columnas,a,5); break;}
+        case 'H': {uint8_t a[5]={0x7F,0x08,0x08,0x08,0x7F}; memcpy(columnas,a,5); break;}
+        case 'I': {uint8_t a[5]={0x41,0x41,0x7F,0x41,0x41}; memcpy(columnas,a,5); break;}
+        case 'J': {uint8_t a[5]={0x20,0x40,0x41,0x3F,0x01}; memcpy(columnas,a,5); break;}
+        case 'K': {uint8_t a[5]={0x7F,0x08,0x14,0x22,0x41}; memcpy(columnas,a,5); break;}
+        case 'L': {uint8_t a[5]={0x7F,0x40,0x40,0x40,0x40}; memcpy(columnas,a,5); break;}
+        case 'M': {uint8_t a[5]={0x7F,0x02,0x0C,0x02,0x7F}; memcpy(columnas,a,5); break;}
+        case 'N': {uint8_t a[5]={0x7F,0x04,0x08,0x10,0x7F}; memcpy(columnas,a,5); break;}
+        case 'O': {uint8_t a[5]={0x3E,0x41,0x41,0x41,0x3E}; memcpy(columnas,a,5); break;}
+        case 'P': {uint8_t a[5]={0x7F,0x09,0x09,0x09,0x06}; memcpy(columnas,a,5); break;}
+        case 'Q': {uint8_t a[5]={0x3E,0x41,0x51,0x21,0x5E}; memcpy(columnas,a,5); break;}
+        case 'R': {uint8_t a[5]={0x7F,0x09,0x19,0x29,0x46}; memcpy(columnas,a,5); break;}
+        case 'S': {uint8_t a[5]={0x46,0x49,0x49,0x49,0x31}; memcpy(columnas,a,5); break;}
+        case 'T': {uint8_t a[5]={0x01,0x01,0x7F,0x01,0x01}; memcpy(columnas,a,5); break;}
+        case 'U': {uint8_t a[5]={0x3F,0x40,0x40,0x40,0x3F}; memcpy(columnas,a,5); break;}
+        case 'V': {uint8_t a[5]={0x1F,0x20,0x40,0x20,0x1F}; memcpy(columnas,a,5); break;}
+        case 'W': {uint8_t a[5]={0x7F,0x20,0x18,0x20,0x7F}; memcpy(columnas,a,5); break;}
+        case 'X': {uint8_t a[5]={0x63,0x14,0x08,0x14,0x63}; memcpy(columnas,a,5); break;}
+        case 'Y': {uint8_t a[5]={0x03,0x04,0x78,0x04,0x03}; memcpy(columnas,a,5); break;}
+        case 'Z': {uint8_t a[5]={0x61,0x51,0x49,0x45,0x43}; memcpy(columnas,a,5); break;}
+
+        case '0': {uint8_t a[5]={0x3E,0x51,0x49,0x45,0x3E}; memcpy(columnas,a,5); break;}
+        case '1': {uint8_t a[5]={0x00,0x42,0x7F,0x40,0x00}; memcpy(columnas,a,5); break;}
+        case '2': {uint8_t a[5]={0x42,0x61,0x51,0x49,0x46}; memcpy(columnas,a,5); break;}
+        case '3': {uint8_t a[5]={0x21,0x41,0x45,0x4B,0x31}; memcpy(columnas,a,5); break;}
+        case '4': {uint8_t a[5]={0x18,0x14,0x12,0x7F,0x10}; memcpy(columnas,a,5); break;}
+        case '5': {uint8_t a[5]={0x27,0x45,0x45,0x45,0x39}; memcpy(columnas,a,5); break;}
+        case '6': {uint8_t a[5]={0x3C,0x4A,0x49,0x49,0x30}; memcpy(columnas,a,5); break;}
+        case '7': {uint8_t a[5]={0x01,0x71,0x09,0x05,0x03}; memcpy(columnas,a,5); break;}
+        case '8': {uint8_t a[5]={0x36,0x49,0x49,0x49,0x36}; memcpy(columnas,a,5); break;}
+        case '9': {uint8_t a[5]={0x06,0x49,0x49,0x29,0x1E}; memcpy(columnas,a,5); break;}
+
+        case '.': {uint8_t a[5]={0,0x60,0x60,0,0}; memcpy(columnas,a,5); break;}
+        case ':': {uint8_t a[5]={0,0x36,0x36,0,0}; memcpy(columnas,a,5); break;}
+        case '%': {uint8_t a[5]={0x63,0x13,0x08,0x64,0x63}; memcpy(columnas,a,5); break;}
+        case '-': {uint8_t a[5]={0x08,0x08,0x08,0x08,0x08}; memcpy(columnas,a,5); break;}
+        case '/': {uint8_t a[5]={0x20,0x10,0x08,0x04,0x02}; memcpy(columnas,a,5); break;}
+
+        default: break;
+    }
+}
+
+static void TFT_Texto(
+    uint16_t x,
+    uint16_t y,
+    const char *texto,
+    uint16_t color,
+    uint16_t fondo,
+    uint8_t escala
+)
+{
+    while (*texto)
+    {
+        char letra = *texto++;
+
+        if (letra >= 'a' && letra <= 'z')
+        {
+            letra -= 32;
+        }
+
+        uint8_t columnas[5];
+
+        TFT_ObtenerLetra(letra, columnas);
+
+        TFT_Rectangulo(
+            x,
+            y,
+            6 * escala,
+            8 * escala,
+            fondo
+        );
+
+        for (uint8_t col = 0; col < 5; col++)
+        {
+            for (uint8_t fila = 0; fila < 7; fila++)
+            {
+                if (columnas[col] & (1 << fila))
+                {
+                    TFT_Rectangulo(
+                        x + col * escala,
+                        y + fila * escala,
+                        escala,
+                        escala,
+                        color
+                    );
+                }
+            }
+        }
+
+        x += 6 * escala;
+
+        if (x + 6 * escala > TFT_ANCHO)
+        {
+            break;
+        }
+    }
+}
+
+// ============================================================
+// INICIALIZAR PANTALLA
+// ============================================================
+
+static void TFT_Init(void)
+{
+    // Mantener microSD deseleccionada
+    HAL_GPIO_WritePin(
+        SD_CS_GPIO_Port,
+        SD_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_RST_GPIO_Port,
+        TFT_RST_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_Delay(30);
+
+    HAL_GPIO_WritePin(
+        TFT_RST_GPIO_Port,
+        TFT_RST_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_Delay(150);
+
+    TFT_Comando(0x01);
+    HAL_Delay(150);
+
+    TFT_Comando(0x28);
+
+    TFT_Comando(0x3A);
+    TFT_Dato(0x55);
+
+    TFT_Comando(0x36);
+    TFT_Dato(0x28);
+
+    TFT_Comando(0x11);
+    HAL_Delay(120);
+
+    TFT_Comando(0x29);
+    HAL_Delay(20);
+
+    TFT_Rectangulo(
+        0, 0,
+        TFT_ANCHO, TFT_ALTO,
+        COLOR_FONDO
+    );
+}
+
+
+// ============================================================
+// INTERFAZ PASTEL 320x240 - basada en la referencia del equipo
+// Se conserva controlador ILI9341 y fuente 5x7.
+// ============================================================
+#define UI_FONDO 0xDFFF
+#define UI_BARRA 0xCF3F
+#define UI_SOMBRA 0xB5D9
+#define UI_BLANCO 0xFFFF
+#define UI_OSCURO 0x110B
+#define UI_AZUL 0x24B8
+#define UI_ROSA 0xF392
+#define UI_CYAN 0x5E7C
+#define UI_VERDE_F 0xBF97
+#define UI_VERDE_T 0x058A
+#define UI_ROJO_F 0xFDD6
+
+static void UI_Linea(int x0,int y0,int x1,int y1,uint16_t color,uint8_t grosor){
+  int dx=(x1>x0)?x1-x0:x0-x1, sx=x0<x1?1:-1;
+  int dy=-((y1>y0)?y1-y0:y0-y1), sy=y0<y1?1:-1;
+  int err=dx+dy;
+  for(;;){if(x0>=0&&y0>=0)TFT_Rectangulo((uint16_t)x0,(uint16_t)y0,grosor,grosor,color);
+    if(x0==x1&&y0==y1)break;
+    int e=2*err; if(e>=dy){err+=dy;x0+=sx;} if(e<=dx){err+=dx;y0+=sy;}}
+}
+static void UI_Circulo(int cx,int cy,int r,uint16_t col){
+  // Circulo relleno por franjas horizontales
+  for(int y=-r;y<=r;y++){
+    int x=0;while((x+1)*(x+1)+y*y<=r*r)x++;
+    if(cx-x>=0&&cy+y>=0)TFT_Rectangulo(cx-x,cy+y,2*x+1,1,col);
+  }
+}
+static void UI_Card(int x,int y,int w,int h){
+  TFT_Rectangulo(x+3,y+4,w,h,UI_SOMBRA);
+  TFT_Rectangulo(x,y,w,h,UI_BLANCO);
+  UI_Circulo(x+7,y+7,7,UI_BLANCO);
+  UI_Circulo(x+w-8,y+7,7,UI_BLANCO);
+  UI_Circulo(x+7,y+h-8,7,UI_BLANCO);
+  UI_Circulo(x+w-8,y+h-8,7,UI_BLANCO);
+}
+static void UI_Corazon(int x,int y,int r,uint16_t col){
+  UI_Circulo(x-r/2,y-r/2,r/2,col);
+  UI_Circulo(x+r/2,y-r/2,r/2,col);
+  for(int k=0;k<=r;k++)UI_Linea(x-r+k,y-r/3+k,x+r-k,y-r/3+k,col,1);
+}
+static void UI_Bebe(int cx,int cy){
+  UI_Circulo(cx,cy,17,UI_AZUL);
+  UI_Circulo(cx,cy,15,0xFE9A);    // piel suave
+  UI_Circulo(cx-5,cy-1,1,UI_OSCURO);
+  UI_Circulo(cx+5,cy-1,1,UI_OSCURO);
+  UI_Linea(cx-3,cy+6,cx,cy+8,UI_OSCURO,1);
+  UI_Linea(cx,cy+8,cx+3,cy+6,UI_OSCURO,1);
+  UI_Circulo(cx-9,cy+5,3,UI_ROSA);
+  UI_Circulo(cx+9,cy+5,3,UI_ROSA);
+  UI_Corazon(cx+19,cy-14,8,UI_ROSA);
+}
+static void UI_Termometro(int x,int y){
+  TFT_Rectangulo(x,y,6,15,UI_AZUL);
+  TFT_Rectangulo(x+2,y+2,2,15,UI_ROSA);
+  UI_Circulo(x+3,y+18,6,UI_ROSA);
+}
+static void UI_Gota(int x,int y){
+  UI_Circulo(x,y+13,9,UI_CYAN);
+  UI_Linea(x-8,y+11,x,y-3,UI_CYAN,2);
+  UI_Linea(x+8,y+11,x,y-3,UI_CYAN,2);
+  UI_Circulo(x,y+13,6,0xC7FF);
+}
+static void UI_Incubadora(void){
+  // Pequeno dibujo vectorial de incubadora
+  TFT_Rectangulo(26,208,60,11,UI_AZUL);
+  TFT_Rectangulo(32,218,6,7,UI_AZUL);
+  TFT_Rectangulo(73,218,6,7,UI_AZUL);
+  UI_Linea(29,207,37,188,UI_CYAN,2);
+  UI_Linea(37,188,75,188,UI_CYAN,2);
+  UI_Linea(75,188,83,207,UI_CYAN,2);
+  UI_Circulo(56,202,6,0xFE9A);
+  UI_Linea(50,209,72,209,UI_AZUL,2);
+}
+static void TFT_PantallaInicial(void){
+  TFT_Rectangulo(0,0,320,240,UI_FONDO);
+  TFT_Rectangulo(0,0,320,55,UI_BARRA);
+  UI_Bebe(27,26);
+  TFT_Texto(53,11,"INCUBADORA",UI_OSCURO,UI_BARRA,2);
+  TFT_Texto(55,35,"NEONATAL",UI_AZUL,UI_BARRA,1);
+  UI_Linea(166,41,260,41,UI_CYAN,2);
+  UI_Card(10,64,145,105);
+  UI_Card(165,64,145,105);
+  UI_Termometro(21,78);
+  UI_Gota(179,77);
+  TFT_Texto(40,78,"TEMPERATURA",UI_OSCURO,UI_BLANCO,1);
+  TFT_Texto(198,78,"HUMEDAD",UI_OSCURO,UI_BLANCO,1);
+  TFT_Texto(22,103,"--.- C",UI_OSCURO,UI_BLANCO,3);
+  TFT_Texto(177,103,"--.- %",UI_OSCURO,UI_BLANCO,3);
+  TFT_Rectangulo(23,145,114,17,UI_VERDE_F);
+  TFT_Rectangulo(177,145,114,17,UI_VERDE_F);
+  TFT_Texto(42,148,"SIN DATO",UI_OSCURO,UI_VERDE_F,1);
+  TFT_Texto(197,148,"SIN DATO",UI_OSCURO,UI_VERDE_F,1);
+  UI_Card(10,180,300,50);
+  UI_Incubadora();
+  TFT_Texto(106,187,"MONITOREO NEONATAL",UI_OSCURO,UI_BLANCO,1);
+  TFT_Texto(106,208,"SIN MEDICION",UI_AZUL,UI_BLANCO,1);
+  UI_Corazon(290,206,11,UI_ROSA);
+}
+static void TFT_ActualizarDatos(void){
+  char texto[32];
+  long t=temperatura10;
+  unsigned long a=(t<0)?(unsigned long)(-t):(unsigned long)t;
+  TFT_Rectangulo(19,98,125,42,UI_BLANCO);
+  TFT_Rectangulo(175,98,124,42,UI_BLANCO);
+  snprintf(texto,sizeof(texto),"%s%lu.%lu C",t<0?"-":"",a/10UL,a%10UL);
+  TFT_Texto(22,103,texto,UI_OSCURO,UI_BLANCO,3);
+  snprintf(texto,sizeof(texto),"%ld.%ld %%",(long)humedad10/10L,(long)humedad10%10L);
+  TFT_Texto(177,103,texto,UI_OSCURO,UI_BLANCO,3);
+  uint8_t tn=(temperatura>=TEMP_MIN&&temperatura<=TEMP_MAX);
+  uint8_t hn=(humedad>=HUM_MIN&&humedad<=HUM_MAX);
+  TFT_Rectangulo(23,145,114,17,tn?UI_VERDE_F:UI_ROJO_F);
+  TFT_Rectangulo(177,145,114,17,hn?UI_VERDE_F:UI_ROJO_F);
+  TFT_Texto(46,148,tn?"NORMAL":"ALERTA",tn?UI_VERDE_T:COLOR_ROJO,tn?UI_VERDE_F:UI_ROJO_F,1);
+  TFT_Texto(197,148,hn?"NORMAL":"ALERTA",hn?UI_VERDE_T:COLOR_ROJO,hn?UI_VERDE_F:UI_ROJO_F,1);
+  TFT_Rectangulo(104,204,160,20,UI_BLANCO);
+  TFT_Texto(106,208,tn&&hn?"SISTEMA ESTABLE":"REVISAR VALORES",
+            tn&&hn?UI_VERDE_T:COLOR_ROJO,UI_BLANCO,1);
+}
+
+// ============================================================
+// PARTE 1: SENSOR AHT10 POR I2C
+// ============================================================
+
+static void AHT10_Init(void)
+{
+    uint8_t comando[3] = {
+        0xE1, 0x08, 0x00
+    };
+
+    sensorDisponible = 0;
+
+    HAL_Delay(40);
+
+    if (HAL_I2C_IsDeviceReady(
+            &hi2c1,
+            AHT10_ADDR,
+            3,
+            100
+        ) == HAL_OK)
+    {
+        if (HAL_I2C_Master_Transmit(
+                &hi2c1,
+                AHT10_ADDR,
+                comando,
+                3,
+                100
+            ) == HAL_OK)
+        {
+            HAL_Delay(20);
+            sensorDisponible = 1;
+        }
+    }
+}
+
+static uint8_t AHT10_Leer(void)
+{
+    uint8_t comando[3] = {
+        0xAC, 0x33, 0x00
+    };
+
+    uint8_t datos[6];
+
+    uint32_t datoHumedad;
+    uint32_t datoTemperatura;
+
+    // Solicitar medicion
+    if (HAL_I2C_Master_Transmit(
+            &hi2c1,
+            AHT10_ADDR,
+            comando,
+            3,
+            100
+        ) != HAL_OK)
+    {
+        sensorDisponible = 0;
+        return 0;
+    }
+
+    HAL_Delay(80);
+
+    // Recibir los 6 bytes del AHT10
+    if (HAL_I2C_Master_Receive(
+            &hi2c1,
+            AHT10_ADDR,
+            datos,
+            6,
+            100
+        ) != HAL_OK)
+    {
+        sensorDisponible = 0;
+        return 0;
+    }
+
+    // Revisar bit de ocupado
+    if (datos[0] & 0x80)
+    {
+        return 0;
+    }
+
+    // Extraer humedad
+    datoHumedad =
+        ((uint32_t)datos[1] << 12) |
+        ((uint32_t)datos[2] << 4) |
+        ((uint32_t)datos[3] >> 4);
+
+    // Extraer temperatura
+    datoTemperatura =
+        (((uint32_t)datos[3] & 0x0F) << 16) |
+        ((uint32_t)datos[4] << 8) |
+        ((uint32_t)datos[5]);
+
+    humedad =
+        ((float)datoHumedad * 100.0f) /
+        1048576.0f;
+
+    temperatura =
+        ((float)datoTemperatura * 200.0f) /
+        1048576.0f - 50.0f;
+
+    temperatura10 = (int32_t)(
+        temperatura * 10.0f +
+        (temperatura >= 0.0f ? 0.5f : -0.5f)
+    );
+
+    humedad10 = (int32_t)(
+        humedad * 10.0f + 0.5f
+    );
+
+    medicionValida = 1;
+
+    return 1;
+}
+
+// ============================================================
+// PARTE 4: PRUEBA DEL AHT10 EN HERCULES
+// ============================================================
+
+static void Hercules_ProbarSensor(void)
+{
+    // Comprobar sensor cada 2 segundos
+    if ((uint32_t)(HAL_GetTick() - tiempoAnteriorSensor)
+        < INTERVALO_SENSOR_MS)
+    {
+        return;
+    }
+
+    tiempoAnteriorSensor = HAL_GetTick();
+
+    // Comprobar si el sensor esta disponible
+    if (!sensorDisponible)
+    {
+        Hercules_Enviar(
+            "AHT10: Intentando inicializar sensor...\r\n"
+        );
+
+        AHT10_Init();
+    }
+
+    if (sensorDisponible && AHT10_Leer())
+    {
+        // Obtener valor absoluto de temperatura
+        long temperaturaAbs =
+            temperatura10 < 0
+            ? -(long)temperatura10
+            : (long)temperatura10;
+
+        // Crear mensaje para Hercules
+        snprintf(
+            mensajeHercules,
+            sizeof(mensajeHercules),
+            "TEMPERATURA: %s%ld.%ld C | HUMEDAD: %ld.%ld %%\r\n",
+            temperatura10 < 0 ? "-" : "",
+            temperaturaAbs / 10,
+            temperaturaAbs % 10,
+            (long)(humedad10 / 10),
+            (long)(humedad10 % 10)
+        );
+
+        // Mostrar la medicion en Hercules
+        Hercules_Enviar(mensajeHercules);
+    }
+    else
+    {
+        Hercules_Enviar(
+            "ERROR: AHT10 NO RESPONDE\r\n"
+        );
+    }
+}
+
+
+// ============================================================
+// PARTE 5: MICROSD (SPI1 compartido con TFT, CS = PB6)
+// Middleware FatFs -> User-defined. Driver: FATFS/Target/user_diskio.c
+// Tarjeta de 64GB: FORMATEAR FAT32 (exFAT no sirve si FF_FS_EXFAT=0)
+// No guardar si no existe una lectura valida.
+// ============================================================
+static FATFS fsSD;
+static uint32_t numeroRegistro = 0;
+static char sdError[48] = "SD_NO_PROBADA";
+
+// Mantener informacion exacta del fallo para Hercules y Dabble.
+static void SD_Error(const char *etapa, unsigned codigo)
+{
+    snprintf(sdError, sizeof(sdError), "SD_%s_%u", etapa, codigo);
+    snprintf(mensajeHercules, sizeof(mensajeHercules),
+             "SD ERROR: %s (codigo %u)\r\n", etapa, codigo);
+    Hercules_Enviar(mensajeHercules);
+}
+
+static uint8_t sdGuardarUltima(void)
+{
+    FRESULT fr;
+    FIL archivo;
+    UINT escritos;
+    uint8_t ok = 0;
+    char registro[96];
+    uint8_t nuevo;
+
+    if (!medicionValida) {
+        strcpy(sdError, "SIN_MEDICION");
+        Hercules_Enviar("SD ERROR: SIN MEDICION VALIDA\r\n");
+        return 0;
+    }
+
+    // El display y la microSD comparten SPI1 pero NO chip select.
+    HAL_GPIO_WritePin(TFT_CS_GPIO_Port, TFT_CS_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
+    Hercules_Enviar("SD: montando FAT32...\r\n");
+
+    // MX_FATFS_Init() debe haber vinculado USER_Driver con unidad 0.
+    fr = f_mount(&fsSD, "0:", 1);
+    if (fr != FR_OK) {
+        SD_Error("MOUNT", (unsigned)fr);
+        (void)f_mount(NULL, "0:", 0);
+        return 0;
+    }
+    Hercules_Enviar("SD: FAT32 montado\r\n");
+
+    fr = f_open(&archivo, "0:/DATOS.CSV", FA_OPEN_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        SD_Error("OPEN", (unsigned)fr);
+        goto desmontar;
+    }
+
+    nuevo = (f_size(&archivo) == 0U);
+    fr = f_lseek(&archivo, f_size(&archivo));
+    if (fr != FR_OK) {
+        SD_Error("SEEK", (unsigned)fr);
+        goto cerrar;
+    }
+
+    if (nuevo) {
+        static const char encabezado[] =
+            "registro,temperatura_C,humedad_porcentaje\r\n";
+        escritos = 0;
+        fr = f_write(&archivo, encabezado,
+                     (UINT)strlen(encabezado), &escritos);
+        if (fr != FR_OK || escritos != strlen(encabezado)) {
+            SD_Error("HEADER", (unsigned)(fr != FR_OK ? fr : 255U));
+            goto cerrar;
+        }
+    }
+
+    // Representacion entera (decimas), sin depender de printf float.
+    long tv = (long)temperatura10;
+    long hv = (long)humedad10;
+    unsigned long ta = tv < 0 ? (unsigned long)(-(int64_t)tv) : (unsigned long)tv;
+    unsigned long ha = hv < 0 ? (unsigned long)(-(int64_t)hv) : (unsigned long)hv;
+    snprintf(registro, sizeof(registro),
+             "%lu,%s%lu.%lu,%s%lu.%lu\r\n",
+             (unsigned long)(numeroRegistro + 1U),
+             tv < 0 ? "-" : "", ta/10UL, ta%10UL,
+             hv < 0 ? "-" : "", ha/10UL, ha%10UL);
+
+    escritos = 0;
+    fr = f_write(&archivo, registro, (UINT)strlen(registro), &escritos);
+    if (fr != FR_OK || escritos != strlen(registro)) {
+        SD_Error("WRITE", (unsigned)(fr != FR_OK ? fr : 255U));
+        goto cerrar;
+    }
+    fr = f_sync(&archivo);
+    if (fr != FR_OK) {
+        SD_Error("SYNC", (unsigned)fr);
+        goto cerrar;
+    }
+    ok = 1;
+
+cerrar:
+    fr = f_close(&archivo);
+    if (fr != FR_OK) {
+        SD_Error("CLOSE", (unsigned)fr);
+        ok = 0;
+    }
+desmontar:
+    (void)f_mount(NULL, "0:", 0);
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
+    if (ok) {
+        numeroRegistro++;
+        strcpy(sdError, "OK");
+        Hercules_Enviar("SD: DATOS.CSV guardado correctamente\r\n");
+    }
+    return ok;
+}
+
+// ============================================================
+// PARTE 2: PROCESAR COMANDOS DE NUCLEO 1
+// ============================================================
+
+static void UART_ProcesarComando(const char *comando)
+{
+    // RESPUESTA A IDENTIFICACION DE NUCLEO 1:
+    // la Nucleo 2 actua como SLAVE LOGICO POR UART.
+    // No utilizar una direccion I2C 0x32 en este enlace.
+    if (strcmp(comando, "PING") == 0 ||
+        strcmp(comando, "HELLO") == 0)
+    {
+        Hercules_Enviar("UART1: PING recibido; enviando ACK\r\n");
+        UART_Enviar("ACK,NUCLEO2\n");
+        return;
+    }
+    // --------------------------------------------------------
+    // COMANDO LECTURA
+    // --------------------------------------------------------
+
+    if (strcmp(comando, "READ") == 0 ||
+        strcmp(comando, "LECTURA") == 0)
+    {
+        // Confirmar llegada del comando por Hercules
+        Hercules_Enviar(
+            "UART1: Comando READ recibido de Nucleo 1\r\n"
+        );
+
+        // Confirmacion temporal para Nucleo 1
+        UART_Enviar("ACK,READ\n");
+
+        if (!sensorDisponible)
+        {
+            AHT10_Init();
+        }
+
+        if (sensorDisponible && AHT10_Leer())
+        {
+            // Enviar temperatura y humedad a Nucleo 1
+            snprintf(
+                mensajeUART,
+                sizeof(mensajeUART),
+                "DATA,%ld,%ld\n",
+                (long)temperatura10,
+                (long)humedad10
+            );
+
+            UART_Enviar(mensajeUART);
+
+            // Mostrar los valores tambien en Hercules (solo tras READ)
+            snprintf(mensajeHercules,sizeof(mensajeHercules),
+                "LECTURA: T=%ld.%ld C H=%ld.%ld %%\r\n",
+                (long)(temperatura10/10),(long)(temperatura10<0?-temperatura10%10:temperatura10%10),
+                (long)(humedad10/10),(long)(humedad10%10));
+            Hercules_Enviar(mensajeHercules);
+
+            // Mostrar valores en pantalla
+            TFT_ActualizarDatos();
+        }
+        else
+        {
+            UART_Enviar(
+                "ERR,AHT10_NO_RESPONDE\n"
+            );
+
+            Hercules_Enviar(
+                "ERROR UART1: Sensor AHT10 no responde\r\n"
+            );
+        }
+    }
+
+    // --------------------------------------------------------
+    // COMANDO GUARDAR
+    // --------------------------------------------------------
+
+    else if (strcmp(comando, "SAVE") == 0 ||
+             strcmp(comando, "GUARDAR") == 0)
+    {
+        Hercules_Enviar(
+            "UART1: Comando SAVE recibido\r\n"
+        );
+
+        if (!medicionValida)
+        {
+            UART_Enviar("ERR,SIN_MEDICION_PARA_GUARDAR\n");
+        }
+        else if(sdGuardarUltima())
+        {
+            UART_Enviar("SAVED\n");
+        }
+        else
+        {
+            snprintf(mensajeUART, sizeof(mensajeUART), "ERR,%s\n", sdError);
+            UART_Enviar(mensajeUART);
+        }
+    }
+    else
+    {
+        UART_Enviar(
+            "ERR,COMANDO_DESCONOCIDO\n"
+        );
+    }
+}
+
+// ============================================================
+// PARTE 2: REVISAR DATOS UART DE NUCLEO 1
+// ============================================================
+
+static void UART_Revisar(void)
+{
+    uint8_t dato;
+
+    if (uartOverflow)
+    {
+        uartOverflow = 0;
+        posicionUART = 0;
+
+        UART_Enviar(
+            "ERR,UART_BUFFER_LLENO\n"
+        );
+    }
+
+    if (uartError)
+    {
+        uartError = 0;
+
+        UART_Enviar(
+            "ERR,UART_RECEPCION\n"
+        );
+    }
+
+    while (UART_ObtenerByte(&dato))
+    {
+        if (dato == '\r')
+        {
+            continue;
+        }
+
+        if (dato == '\n')
+        {
+            comandoUART[posicionUART] = '\0';
+
+            if (posicionUART > 0)
+            {
+                snprintf(mensajeHercules,sizeof(mensajeHercules),
+                 "DIAG N2: USART1 RECIBIO [%s]\r\n",comandoUART);
+                Hercules_Enviar(mensajeHercules);
+                UART_ProcesarComando(comandoUART);
+            }
+
+            posicionUART = 0;
+        }
+        else if (dato >= 32 && dato <= 126 &&
+                 posicionUART < sizeof(comandoUART) - 1)
+        {
+            comandoUART[posicionUART++] = (char)dato;
+        }
+        else
+        {
+            posicionUART = 0;
+            Hercules_Enviar("UART1: caracter invalido o comando largo\r\n");
+        }
+    }
+}
+
+/* USER CODE END 0 */
+
+/**
+ * @brief Application entry point
+ */
+int main(void)
+{
+    /* USER CODE BEGIN 1 */
+    /* USER CODE END 1 */
+
+    HAL_Init();
+
+    /* USER CODE BEGIN Init */
+    /* USER CODE END Init */
+
+    SystemClock_Config();
+
+    /* USER CODE BEGIN SysInit */
+    /* USER CODE END SysInit */
+
+    // ========================================================
+    // INICIALIZACION DE PERIFERICOS
+    // ========================================================
+
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_I2C1_Init();
+
+    // Nucleo 1
+    MX_USART1_UART_Init();
+
+    // Hercules
+    MX_USART2_UART_Init();
+
+    // FatFs (el user_diskio.c debe sustituirse por el incluido)
+    MX_FATFS_Init();
+
+    /* USER CODE BEGIN 2 */
+
+    // Mantener microSD deseleccionada
+    HAL_GPIO_WritePin(
+        SD_CS_GPIO_Port,
+        SD_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    // Iniciar UART1 por interrupciones
+    UART_IniciarRecepcion();
+
+    // Mensaje inicial a Hercules
+    HAL_Delay(500);
+
+    Hercules_Enviar(
+        "\r\n================================\r\n"
+    );
+
+    Hercules_Enviar(
+        "NUCLEO 2 - INCUBADORA NEONATAL\r\n"
+    );
+
+    Hercules_Enviar(
+        "PRUEBA SERIAL DEL SENSOR AHT10\r\n"
+    );
+
+    Hercules_Enviar(
+        "================================\r\n"
+    );
+
+    Hercules_Enviar(
+        "USART2: Hercules conectado por USB\r\n"
+    );
+
+    Hercules_Enviar(
+        "USART1: Comunicacion con Nucleo 1 - PING/ACK activo\r\n"
+    );
+
+    Hercules_Enviar(
+        "Inicializando sensor AHT10...\r\n"
+    );
+
+    // Inicializar sensor
+    AHT10_Init();
+
+    if (sensorDisponible)
+    {
+        Hercules_Enviar(
+            "AHT10: Dispositivo detectado por I2C\r\n"
+        );
+    }
+    else
+    {
+        Hercules_Enviar(
+            "AHT10: No detectado en direccion 0x38\r\n"
+        );
+    }
+
+    // Inicializar pantalla
+    TFT_Init();
+
+    // Mostrar diseño original
+    TFT_PantallaInicial();
+
+    Hercules_Enviar(
+        "Pantalla TFT inicializada\r\n"
+    );
+
+    Hercules_Enviar(
+        AUTO_HERCULES ? "Prueba Hercules cada 2s activada\r\n" : "Hercules muestra lecturas solicitadas por READ\r\n"
+    );
+
+    // Iniciar intervalo de lectura
+    tiempoAnteriorSensor = HAL_GetTick();
+
+    /* USER CODE END 2 */
+
+    /* Infinite loop */
+    /* USER CODE BEGIN WHILE */
+
+    while (1)
+    {
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+
+        // Comunicacion con Nucleo 1
+        UART_Revisar();
+
+        // Lecturas automaticas enviadas a Hercules
+        if(AUTO_HERCULES) Hercules_ProbarSensor();
+
+        HAL_Delay(2);
+    }
+
+    /* USER CODE END 3 */
+}
+
+// ============================================================
+// CONFIGURACION DEL RELOJ
+// ============================================================
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE3
+    );
+
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSI;
+
+    RCC_OscInitStruct.HSIState =
+        RCC_HSI_ON;
+
+    RCC_OscInitStruct.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_ON;
+
+    RCC_OscInitStruct.PLL.PLLSource =
+        RCC_PLLSOURCE_HSI;
+
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ = 2;
+    RCC_OscInitStruct.PLL.PLLR = 2;
+
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct)
+        != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV2;
+
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_2
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+// ============================================================
+// I2C1: SENSOR AHT10
+// ============================================================
+
+static void MX_I2C1_Init(void)
+{
+    /* USER CODE BEGIN I2C1_Init 0 */
+    /* USER CODE END I2C1_Init 0 */
+
+    /* USER CODE BEGIN I2C1_Init 1 */
+    /* USER CODE END I2C1_Init 1 */
+
+    hi2c1.Instance = I2C1;
+
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+
+    hi2c1.Init.OwnAddress2 = 0;
+
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* USER CODE BEGIN I2C1_Init 2 */
+    /* USER CODE END I2C1_Init 2 */
+}
+
+// ============================================================
+// SPI1: PANTALLA TFT
+// ============================================================
+
+static void MX_SPI1_Init(void)
+{
+    /* USER CODE BEGIN SPI1_Init 0 */
+    /* USER CODE END SPI1_Init 0 */
+
+    /* USER CODE BEGIN SPI1_Init 1 */
+    /* USER CODE END SPI1_Init 1 */
+
+    hspi1.Instance = SPI1;
+
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+
+    hspi1.Init.BaudRatePrescaler =
+        SPI_BAUDRATEPRESCALER_16;
+
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+
+    hspi1.Init.CRCCalculation =
+        SPI_CRCCALCULATION_DISABLE;
+
+    hspi1.Init.CRCPolynomial = 10;
+
+    if (HAL_SPI_Init(&hspi1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* USER CODE BEGIN SPI1_Init 2 */
+    /* USER CODE END SPI1_Init 2 */
+}
+
+// ============================================================
+// USART1: COMUNICACION CON NUCLEO 1
+// ============================================================
+
+static void MX_USART1_UART_Init(void)
+{
+    /* USER CODE BEGIN USART1_Init 0 */
+    /* USER CODE END USART1_Init 0 */
+
+    /* USER CODE BEGIN USART1_Init 1 */
+    /* USER CODE END USART1_Init 1 */
+
+    huart1.Instance = USART1;
+
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* USER CODE BEGIN USART1_Init 2 */
+    /* USER CODE END USART1_Init 2 */
+}
+
+// ============================================================
+// USART2: COMUNICACION CON HERCULES
+// ============================================================
+
+static void MX_USART2_UART_Init(void)
+{
+    /* USER CODE BEGIN USART2_Init 0 */
+    /* USER CODE END USART2_Init 0 */
+
+    /* USER CODE BEGIN USART2_Init 1 */
+    /* USER CODE END USART2_Init 1 */
+
+    huart2.Instance = USART2;
+
+    huart2.Init.BaudRate = 115200;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* USER CODE BEGIN USART2_Init 2 */
+    /* USER CODE END USART2_Init 2 */
+}
+
+// ============================================================
+// GPIO: PANTALLA Y MICROSD
+// ============================================================
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* USER CODE BEGIN MX_GPIO_Init_1 */
+    /* USER CODE END MX_GPIO_Init_1 */
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(
+        LCD_RESET_GPIO_Port,
+        LCD_RESET_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        LCD_DC_GPIO_Port,
+        LCD_DC_Pin,
+        GPIO_PIN_RESET
+    );
+
+    // Desactivar pantalla y microSD inicialmente
+    HAL_GPIO_WritePin(
+        LCD_CS_GPIO_Port,
+        LCD_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        SD_CS_GPIO_Port,
+        SD_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    // Boton B1
+    GPIO_InitStruct.Pin = B1_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+
+    HAL_GPIO_Init(
+        B1_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    // RESET pantalla
+    GPIO_InitStruct.Pin = LCD_RESET_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+
+    HAL_GPIO_Init(
+        LCD_RESET_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    // DC pantalla
+    GPIO_InitStruct.Pin = LCD_DC_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+
+    HAL_GPIO_Init(
+        LCD_DC_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    // CS pantalla
+    GPIO_InitStruct.Pin = LCD_CS_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+
+    HAL_GPIO_Init(
+        LCD_CS_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    // CS microSD
+    GPIO_InitStruct.Pin = SD_CS_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(
+        SD_CS_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    /* USER CODE BEGIN MX_GPIO_Init_2 */
+    /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+/* USER CODE END 4 */
+
+// ============================================================
+// MANEJO DE ERRORES
+// ============================================================
+
+void Error_Handler(void)
+{
+    /* USER CODE BEGIN Error_Handler_Debug */
+
+    __disable_irq();
+
+    while (1)
+    {
+    }
+
+    /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef USE_FULL_ASSERT
+
+void assert_failed(uint8_t *file, uint32_t line)
+{
+    /* USER CODE BEGIN 6 */
+    /* USER CODE END 6 */
+}
+
+#endif
