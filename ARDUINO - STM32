@@ -1,0 +1,334 @@
+
+/*
+ * ============================================================
+ * PROYECTO: INCUBADORA NEONATAL
+ * MICROCONTROLADOR: ESP32 DEVKIT V1
+ *
+ * ARDUINO ESP32 CORE: 2.0.17
+ * BIBLIOTECA: DabbleESP32 1.5.1
+ *
+ * PARTE 2: UART CON NUCLEO 1
+ * PARTE 3: BLUETOOTH BLE CON DABBLE
+ *
+ * CONEXIONES:
+ * GPIO17 TX2 -> Nucleo 1 PA10 RX
+ * GPIO16 RX2 -> Nucleo 1 PA9 TX
+ * GND        -> Nucleo 1 GND
+ *
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEAdvertising.h>
+
+#define CUSTOM_SETTINGS
+#define INCLUDE_TERMINAL_MODULE
+#include <DabbleESP32.h>
+
+// ============================================================
+// CONFIGURACION UART
+// ============================================================
+
+#define ESP_RX2 16
+#define ESP_TX2 17
+#define BAUDIOS 115200
+
+// ============================================================
+// CONFIGURACION BLUETOOTH
+// ============================================================
+
+#define NOMBRE_BLE "INCUBADORA"
+
+// UUID del servicio utilizado por DabbleESP32
+#define SERVICIO_DABBLE \
+"6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// ============================================================
+// VARIABLES
+// ============================================================
+
+String comando = "";
+String lineaN1 = "";
+
+bool descartar = false;
+
+// ============================================================
+// CONFIGURAR ANUNCIO BLUETOOTH BLE
+// ============================================================
+
+void configurarBLE()
+{
+    Serial.println("Configurando anuncio Bluetooth...");
+
+    BLEAdvertising *anuncio = BLEDevice::getAdvertising();
+
+    if (anuncio == nullptr)
+    {
+        Serial.println("ERROR: BLE no disponible");
+        return;
+    }
+
+    // Detener anuncio anterior
+    anuncio->stop();
+    delay(200);
+
+    // Publicar el servicio BLE de Dabble
+    BLEAdvertisementData datosPublicidad;
+
+    datosPublicidad.setFlags(0x06);
+
+    datosPublicidad.setCompleteServices(
+        BLEUUID(SERVICIO_DABBLE)
+    );
+
+    // Publicar el nombre en la respuesta de escaneo
+    BLEAdvertisementData datosEscaneo;
+
+    datosEscaneo.setName(NOMBRE_BLE);
+
+    anuncio->setAdvertisementData(datosPublicidad);
+
+    anuncio->setScanResponseData(datosEscaneo);
+
+    // Permitir que BLE configure los datos
+    delay(500);
+
+    // Iniciar nuevamente el anuncio
+    anuncio->start();
+
+    Serial.println("Anuncio BLE solicitado");
+    Serial.println("Nombre: INCUBADORA");
+}
+
+// ============================================================
+// PROCESAR COMANDOS DE DABBLE
+// ============================================================
+
+void procesarComando(String texto)
+{
+    texto.trim();
+    texto.toUpperCase();
+
+    if (texto.length() == 0)
+    {
+        return;
+    }
+
+    Serial.print("DABBLE RECIBIO: ");
+    Serial.println(texto);
+
+    // --------------------------------------------------------
+    // PRUEBA BLUETOOTH
+    // --------------------------------------------------------
+
+    if (texto == "PRUEBA")
+    {
+        Terminal.println("DABBLE FUNCIONA");
+
+        Serial.println("Prueba Bluetooth correcta");
+    }
+
+    // --------------------------------------------------------
+    // PRUEBA UART CON NUCLEO 1
+    // --------------------------------------------------------
+
+    else if (texto == "PING")
+    {
+        Serial2.print("PING\n");
+
+        Terminal.println("Enviando PING a Nucleo 1");
+
+        Serial.println("UART2: PING enviado");
+    }
+
+    // --------------------------------------------------------
+    // COMANDO LECTURA
+    // --------------------------------------------------------
+
+    else if (texto == "LECTURA")
+    {
+        Serial2.print("LECTURA\n");
+
+        Terminal.println(
+            "Solicitando lectura del AHT10..."
+        );
+
+        Serial.println(
+            "UART2: LECTURA enviada a Nucleo 1"
+        );
+    }
+
+    // --------------------------------------------------------
+    // COMANDO GUARDAR
+    // --------------------------------------------------------
+
+    else if (texto == "GUARDAR")
+    {
+        Serial2.print("GUARDAR\n");
+
+        Terminal.println(
+            "Solicitando guardado en microSD..."
+        );
+
+        Serial.println(
+            "UART2: GUARDAR enviada a Nucleo 1"
+        );
+    }
+
+    // --------------------------------------------------------
+    // COMANDO NO RECONOCIDO
+    // --------------------------------------------------------
+
+    else
+    {
+        Terminal.println("Comando no reconocido - Favor, no sea tonto");
+
+        Terminal.println(
+            "Use PRUEBA, PING, LECTURA o GUARDAR"
+        );
+    }
+}
+
+// ============================================================
+// RECIBIR COMANDOS DESDE DABBLE
+// ============================================================
+
+void revisarDabble()
+{
+    if (Terminal.available())
+    {
+        comando = Terminal.readString();
+
+        procesarComando(comando);
+
+        comando = "";
+    }
+}
+
+// ============================================================
+// RECIBIR RESPUESTAS DE NUCLEO 1
+// ============================================================
+
+void revisarNucleo()
+{
+    while (Serial2.available() > 0)
+    {
+        uint8_t b = (uint8_t)Serial2.read();
+
+        // Ignorar retorno de carro
+        if (b == '\r')
+        {
+            continue;
+        }
+
+        // Mensaje completo
+        if (b == '\n')
+        {
+            if (!descartar && lineaN1.length() > 0)
+            {
+                Serial.print("NUCLEO 1: ");
+                Serial.println(lineaN1);
+
+                Terminal.println(lineaN1);
+            }
+            else if (descartar)
+            {
+                Serial.println(
+                    "UART: trama invalida descartada"
+                );
+            }
+
+            lineaN1 = "";
+            descartar = false;
+        }
+
+        // Guardar caracteres recibidos
+        else if (!descartar)
+        {
+            if (b >= 32 &&
+                b <= 126 &&
+                lineaN1.length() < 190)
+            {
+                lineaN1 += (char)b;
+            }
+            else
+            {
+                lineaN1 = "";
+                descartar = true;
+            }
+        }
+    }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    // Monitor Serial USB
+    Serial.begin(115200);
+
+    delay(500);
+
+    // Comunicacion UART2 con Nucleo 1
+    Serial2.begin(
+        BAUDIOS,
+        SERIAL_8N1,
+        ESP_RX2,
+        ESP_TX2
+    );
+
+    comando.reserve(48);
+    lineaN1.reserve(192);
+
+    Serial.println();
+    Serial.println("============================");
+    Serial.println("INCUBADORA NEONATAL");
+    Serial.println("============================");
+
+    Serial.println("ESP32 INICIADO");
+
+    Serial.println("UART2: 115200");
+    Serial.println("TX2: GPIO17");
+    Serial.println("RX2: GPIO16");
+
+    // Iniciar Dabble BLE
+    Serial.println("Iniciando Dabble BLE...");
+
+    Dabble.begin(NOMBRE_BLE);
+
+    delay(500);
+
+    // Configurar anuncio BLE
+    configurarBLE();
+
+    Serial.println();
+    Serial.println("COMANDOS DISPONIBLES:");
+    Serial.println("PRUEBA");
+    Serial.println("PING");
+    Serial.println("LECTURA");
+    Serial.println("GUARDAR");
+
+    Serial.println();
+    Serial.println("Esperando conexion Bluetooth...");
+}
+
+// ============================================================
+// LOOP PRINCIPAL
+// ============================================================
+
+void loop()
+{
+    // Procesar comunicacion BLE
+    Dabble.processInput();
+
+    // Recibir comandos desde el celular
+    revisarDabble();
+
+    // Recibir informacion desde Nucleo 1
+    revisarNucleo();
+
+    delay(2);
+}
