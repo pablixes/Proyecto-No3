@@ -1,0 +1,821 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Nucleo 1 - Incubadora neonatal
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+DAC_HandleTypeDef hdac;
+
+I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim1;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+
+/* USER CODE BEGIN PV */
+// ============================================================
+// UART: USART1 ESP32, USART2 PC, USART3 Nucleo 2
+// ============================================================
+#define RING_CAP 256U
+#define NEOPIXEL_BITS 24U
+#define NEOPIXEL_RESET 64U
+#define NEO_DUTY_0  33U     // ~0.39 us a 84 MHz
+#define NEO_DUTY_1  68U     // ~0.81 us a 84 MHz
+#define SFX_SAMPLE_RATE 16000U
+
+typedef struct {
+    volatile uint16_t wr, rd;
+    uint8_t data[RING_CAP];
+    volatile uint8_t over;
+} Ring;
+static Ring fromESP={0}, fromN2={0};
+static uint8_t byteESP, byteN2;
+static char cmdESP[48], cmdN2[120];
+static uint8_t nESP=0, nN2=0;
+static char salida[192];
+static uint8_t pending=0;      // 0 nada, 1 LECTURA, 2 GUARDAR
+static uint32_t pendingSince=0;
+
+// ============================================================
+// NeoPixel WS2812, un LED en PA8 (TIM1_CH1)
+// DMA2_Stream6 / DMA_CHANNEL_0 / Halfword
+// ============================================================
+static DMA_HandleTypeDef hdmaNeo;
+static uint16_t neoPwm[NEOPIXEL_BITS+NEOPIXEL_RESET];
+static volatile uint8_t neoBusy=0;
+static uint8_t neoR=0,neoG=0,neoB=0;
+static uint8_t neoChanged=1;
+static uint32_t neoUntil=0;
+
+typedef struct {uint16_t hz; uint16_t ms;} Nota;
+// Dos EFECTOS ORIGINALES (no reproducen melodias comerciales)
+static const Nota sonidoLectura[]={{523,100},{659,100},{784,160},{0,50}};
+static const Nota sonidoGuardar[]={{880,80},{0,40},{1175,80},{0,40},{1568,170}};
+static const Nota *sfxNotas=NULL;
+static uint8_t sfxTotal=0,sfxIndice=0;
+static uint32_t sfxHasta=0;
+static volatile uint32_t sfxPhase=0, sfxStep=0;
+static TIM_HandleTypeDef htim6app;
+// DIAGNOSTICO UART: contadores independientes, no alteran recepcion
+static volatile uint32_t diagBytesESP=0, diagBytesN2=0;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_DAC_Init(void);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+// Temporizador TIM6 y DMA NeoPixel se configuran en la aplicacion.
+// No activar TIM6 ni TIM1 DMA desde CubeMX para evitar ISR duplicadas.
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// ============================================================
+// PROTOCOLO UART
+// ESP32 -> Nucleo 1: LECTURA, GUARDAR
+// Nucleo 1 -> Nucleo 2: READ, SAVE
+// Nucleo 2 -> Nucleo 1: DATA,T10,H10 / SAVED / ERR,x
+// ============================================================
+static void ringPush(Ring *q,uint8_t b){uint16_t nx=(q->wr+1U)%RING_CAP;
+  if(nx==q->rd){q->over=1;return;} q->data[q->wr]=b;q->wr=nx;}
+static uint8_t ringPop(Ring *q,uint8_t *out){if(q->rd==q->wr)return 0;
+  *out=q->data[q->rd];q->rd=(q->rd+1U)%RING_CAP;return 1;}
+static void sendU(UART_HandleTypeDef *h,const char *s){
+  HAL_UART_Transmit(h,(uint8_t*)s,(uint16_t)strlen(s),300);
+}
+static void report(const char *s){sendU(&huart2,s);sendU(&huart1,s);}
+
+// ============================================================
+// DAC AUDIO - TIM6 SOLO DURANTE UN COMANDO
+// APB1 /4: PCLK1=21 MHz, TIM6CLK=42 MHz (por multiplicador x2)
+// PSC=20, ARR=124 => 42 MHz / (21 * 125) = 16000 Hz
+// DAC PA4 (A2) -> capacitor de acoplo -> LM386 -> bocina
+// ============================================================
+void TIM6_DAC_IRQHandler(void){HAL_TIM_IRQHandler(&htim6app);}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+  if(htim->Instance!=TIM6) return;
+  uint32_t step=sfxStep;
+  if(step==0U){
+    HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,0U);
+    return;
+  }
+  sfxPhase+=step;
+  uint16_t saw=(uint16_t)(sfxPhase >> 20);
+  uint16_t tri=(saw < 2048U)?saw:(4095U-saw);
+  uint32_t val=950U+(uint32_t)tri;
+  HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,val);
+}
+
+static void audioInit(void){
+  __HAL_RCC_TIM6_CLK_ENABLE();
+  htim6app.Instance=TIM6;
+  // Con APB1 dividido entre 4, TIM6 funciona a 42 MHz.
+  htim6app.Init.Prescaler=20U;
+  htim6app.Init.CounterMode=TIM_COUNTERMODE_UP;
+  htim6app.Init.Period=124U;
+  htim6app.Init.AutoReloadPreload=TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if(HAL_TIM_Base_Init(&htim6app)!=HAL_OK)Error_Handler();
+  if(HAL_DAC_Start(&hdac,DAC_CHANNEL_1)!=HAL_OK)Error_Handler();
+  HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,0U);
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn,6,0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  // NO iniciar TIM6 aqui. La bocina queda en silencio.
+}
+
+static void audioNote(uint16_t hz){
+  if(hz==0U){
+    sfxStep=0;
+    HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,0U);
+    return;
+  }
+  uint32_t step=(uint32_t)(((uint64_t)hz<<32)/SFX_SAMPLE_RATE);
+  __disable_irq();
+  sfxPhase=0;
+  sfxStep=step;
+  __enable_irq();
+}
+
+static void audioStop(void){
+  HAL_TIM_Base_Stop_IT(&htim6app);
+  sfxStep=0;
+  sfxPhase=0;
+  sfxNotas=NULL;
+  sfxTotal=0;
+  sfxIndice=0;
+  HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,0U);
+}
+
+static void audioPlay(const Nota *notes,uint8_t n){
+  if(notes==NULL || n==0U)return;
+  // Reiniciar audio solo ante un nuevo comando valido.
+  HAL_TIM_Base_Stop_IT(&htim6app);
+  HAL_DAC_SetValue(&hdac,DAC_CHANNEL_1,DAC_ALIGN_12B_R,0U);
+  sfxNotas=notes;
+  sfxTotal=n;
+  sfxIndice=0;
+  audioNote(notes[0].hz);
+  sfxHasta=HAL_GetTick()+notes[0].ms;
+  __HAL_TIM_SET_COUNTER(&htim6app,0);
+  if(HAL_TIM_Base_Start_IT(&htim6app)!=HAL_OK)Error_Handler();
+}
+
+static void audioTick(void){
+  if(!sfxNotas || (int32_t)(HAL_GetTick()-sfxHasta)<0)return;
+  sfxIndice++;
+  if(sfxIndice>=sfxTotal){
+    audioStop();
+    return;
+  }
+  audioNote(sfxNotas[sfxIndice].hz);
+  sfxHasta=HAL_GetTick()+sfxNotas[sfxIndice].ms;
+}
+
+// ============================================================
+// NeoPixel PWM DMA: TIM1 CH1 PA8, periodo 104 (84MHz -> 800kHz)
+// DMA2 Stream6 Channel0, memoria/periferico halfword, normal
+// ============================================================
+void DMA2_Stream6_IRQHandler(void){HAL_DMA_IRQHandler(&hdmaNeo);}
+static void neoDMAInit(void){
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  hdmaNeo.Instance=DMA2_Stream6;
+  hdmaNeo.Init.Channel=DMA_CHANNEL_0;
+  hdmaNeo.Init.Direction=DMA_MEMORY_TO_PERIPH;
+  hdmaNeo.Init.PeriphInc=DMA_PINC_DISABLE;
+  hdmaNeo.Init.MemInc=DMA_MINC_ENABLE;
+  hdmaNeo.Init.PeriphDataAlignment=DMA_PDATAALIGN_HALFWORD;
+  hdmaNeo.Init.MemDataAlignment=DMA_MDATAALIGN_HALFWORD;
+  hdmaNeo.Init.Mode=DMA_NORMAL;
+  hdmaNeo.Init.Priority=DMA_PRIORITY_HIGH;
+  hdmaNeo.Init.FIFOMode=DMA_FIFOMODE_DISABLE;
+  if(HAL_DMA_Init(&hdmaNeo)!=HAL_OK)Error_Handler();
+  __HAL_LINKDMA(&htim1,hdma[TIM_DMA_ID_CC1],hdmaNeo);
+  HAL_NVIC_SetPriority(DMA2_Stream6_IRQn,5,0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream6_IRQn);
+}
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim){
+  if(htim->Instance==TIM1){
+    HAL_TIM_PWM_Stop_DMA(&htim1,TIM_CHANNEL_1);
+    neoBusy=0;
+  }
+}
+static void neoColor(uint8_t r,uint8_t g,uint8_t b){
+  neoR=r;neoG=g;neoB=b;neoChanged=1;
+}
+static void neoTick(void){
+  if(!neoChanged || neoBusy) return;
+  neoChanged=0;
+  uint32_t rgb=((uint32_t)neoG<<16)|((uint32_t)neoR<<8)|neoB;
+  for(uint8_t i=0;i<24U;i++){
+    neoPwm[i]=(rgb&(1UL<<(23U-i)))?NEO_DUTY_1:NEO_DUTY_0;
+  }
+  for(uint8_t i=24U;i<sizeof(neoPwm)/sizeof(neoPwm[0]);i++)neoPwm[i]=0;
+  neoBusy=1;
+  __HAL_TIM_SET_COUNTER(&htim1,0);
+  if(HAL_TIM_PWM_Start_DMA(&htim1,TIM_CHANNEL_1,
+      (uint32_t*)neoPwm,(uint16_t)(sizeof(neoPwm)/sizeof(neoPwm[0])))!=HAL_OK){
+    neoBusy=0;
+  }
+}
+static void stateIdle(void){neoColor(0,22,3);}
+static void stateRead(void){neoColor(0,12,28);}
+static void stateSend(void){neoColor(0,0,30);}
+static void stateSave(void){neoColor(24,0,20);}
+static void stateError(void){neoColor(38,0,0);}
+static void stateHold(uint32_t ms){neoUntil=HAL_GetTick()+ms;}
+
+// ============================================================
+// ENLACE UART CON NUCLEO 2 (SLAVE LOGICO)
+// Una UART no tiene direccion 0x32 ni esclavo fisico.
+// PING -> ACK,NUCLEO2; antes de READ/SAVE se verifica enlace.
+// pending: 0 libre; 1 lectura; 2 guardado; 3 PING;
+//          4 esperando ACK antes READ; 5 antes SAVE.
+// ============================================================
+static void commandFromESP(const char *c){
+  if(strcmp(c,"PRUEBA")==0){
+    report("NUCLEO 1 FUNCIONA\r\n");
+    return;
+  }
+  if(strcmp(c,"PING")==0){
+    pending=3;pendingSince=HAL_GetTick();
+    report("NUCLEO 1 RECIBIO PING\r\n");
+    sendU(&huart3,"PING\n");
+    report("PING ENVIADO A NUCLEO 2\r\n");
+    return;
+  }
+  if(pending){
+    report("AVISO: OPERACION EN CURSO, ESPERE\r\n");
+    return;
+  }
+  if(strcmp(c,"LECTURA")==0 || strcmp(c,"READ")==0){
+    pending=4;pendingSince=HAL_GetTick();stateRead();
+    audioPlay(sonidoLectura,sizeof(sonidoLectura)/sizeof(Nota));
+    report("NUCLEO 1 RECIBIO LECTURA\r\n");
+    report("VERIFICANDO ENLACE UART CON NUCLEO 2\r\n");
+    sendU(&huart3,"PING\n");
+  } else if(strcmp(c,"GUARDAR")==0 || strcmp(c,"SAVE")==0){
+    pending=5;pendingSince=HAL_GetTick();stateSave();
+    audioPlay(sonidoGuardar,sizeof(sonidoGuardar)/sizeof(Nota));
+    report("NUCLEO 1 RECIBIO GUARDAR\r\n");
+    sendU(&huart3,"PING\n");
+  } else report("ERROR: COMANDO DESCONOCIDO\r\n");
+}
+static void responseFromN2(const char *s){
+  // Confirmacion de enlace, equivalente al handshake del profesor,
+  // pero para UART en vez de I2C o SPI.
+  if(strcmp(s,"ACK,NUCLEO2")==0){
+    report("ENLACE UART OK: NUCLEO 2 RESPONDIO\r\n");
+    if(pending==4){
+      pending=1;pendingSince=HAL_GetTick();
+      sendU(&huart3,"READ\n");
+      report("NUCLEO 1 ENVIO READ A NUCLEO 2\r\n");
+    } else if(pending==5){
+      pending=2;pendingSince=HAL_GetTick();
+      sendU(&huart3,"SAVE\n");
+      report("NUCLEO 1 ENVIO SAVE A NUCLEO 2\r\n");
+    } else if(pending==3){
+      pending=0;
+      report("PING CORRECTO: ESP32 - N1 - N2\r\n");
+    }
+    return;
+  }
+  long t10,h10;
+  if(sscanf(s,"DATA,%ld,%ld",&t10,&h10)==2){
+    if(pending!=1){report("AVISO: DATA SIN SOLICITUD\r\n");return;}
+    unsigned long at=t10<0?(unsigned long)(-(int64_t)t10):(unsigned long)t10;
+    unsigned long ah=h10<0?(unsigned long)(-(int64_t)h10):(unsigned long)h10;
+    snprintf(salida,sizeof(salida),"TEMPERATURA: %s%lu.%lu C | HUMEDAD: %s%lu.%lu %%\r\n",
+      t10<0?"-":"",at/10UL,at%10UL,h10<0?"-":"",ah/10UL,ah%10UL);
+    report(salida);pending=0;stateSend();stateHold(950);
+  } else if(strcmp(s,"SAVED")==0){
+    report("GUARDADO OK: DATOS.CSV EN MICROSD\r\n");
+    pending=0;stateSave();stateHold(1300);
+  } else if(strncmp(s,"ERR,",4)==0){
+    snprintf(salida,sizeof(salida),"ERROR NUCLEO 2: %s\r\n",s+4);
+    report(salida);pending=0;stateError();stateHold(1900);
+  } else if(strncmp(s,"ACK,",4)==0){
+    snprintf(salida,sizeof(salida),"NUCLEO 2: %s\r\n",s+4);
+    report(salida);
+  } else {
+    snprintf(salida,sizeof(salida),"NUCLEO 2 MENSAJE: %s\r\n",s);
+    report(salida);
+  }
+}
+static void readPort(Ring *q,char *buf,uint8_t *n,uint8_t limit,uint8_t esp){
+  uint8_t b;
+  if(q->over){q->over=0;*n=0;report("AVISO: BUFFER UART LLENO\r\n");}
+  while(ringPop(q,&b)){
+    if(b=='\r')continue;
+    if(b=='\n'){
+      buf[*n]=0;
+      if(*n){if(esp)commandFromESP(buf);else responseFromN2(buf);}
+      *n=0;
+    }else if(b>=32 && b<=126 && *n<limit-1U){buf[(*n)++]=(char)b;}
+    else {*n=0;}
+  }
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
+  MX_DAC_Init();
+  MX_TIM1_Init();
+  /* USER CODE BEGIN 2 */
+// Iniciar recepcion UART por interrupciones (NVIC USART1 y USART3)
+if(HAL_UART_Receive_IT(&huart1,&byteESP,1U)!=HAL_OK)Error_Handler();
+if(HAL_UART_Receive_IT(&huart3,&byteN2,1U)!=HAL_OK)Error_Handler();
+// DAC en silencio; TIM6 solo arranca al solicitar LECTURA o GUARDAR
+neoDMAInit();
+audioInit();
+stateIdle();
+report("NUCLEO 1 LISTA - LECTURA / GUARDAR\r\n");
+// Inicio prueba automatica. Solo USART2 (Hercules) muestra el diagnostico.
+uint32_t diagInicio=HAL_GetTick();
+uint32_t diagUltimo=diagInicio;
+uint8_t diagPingEnviado=0;
+sendU(&huart2,"DIAG N1: UART1 ESP32 / UART3 NUCLEO2 activos\r\n");
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    readPort(&fromESP,cmdESP,&nESP,sizeof(cmdESP),1);
+    readPort(&fromN2,cmdN2,&nN2,sizeof(cmdN2),0);
+    // PING unico, 2.5 s despues del arranque, sin interrumpir operaciones.
+    if(!diagPingEnviado && pending==0 && HAL_GetTick()-diagInicio>=2500U){
+      diagPingEnviado=1;
+      pending=3;
+      pendingSince=HAL_GetTick();
+      sendU(&huart2,"DIAG N1: enviando PING por USART3 a Nucleo 2\r\n");
+      sendU(&huart3,"PING\n");
+    }
+    // Contadores para identificar por cual UART llegan bytes.
+    if(HAL_GetTick()-diagUltimo>=5000U){
+      diagUltimo=HAL_GetTick();
+      snprintf(salida,sizeof(salida),
+        "DIAG N1: bytes ESP32/USART1=%lu | N2/USART3=%lu\r\n",
+        (unsigned long)diagBytesESP,(unsigned long)diagBytesN2);
+      sendU(&huart2,salida);
+    }
+    if(pending && HAL_GetTick()-pendingSince>6000U){
+      if(pending==4 || pending==5 || pending==3){
+        report("ERROR: SIN ACK DE NUCLEO 2 - REVISAR UART3 Y CABLE PC11\r\n");
+      } else {
+        report("ERROR: NUCLEO 2 NO COMPLETO LA OPERACION\r\n");
+      }
+      pending=0;
+      stateError();stateHold(1900);
+      }
+    if(neoUntil && (int32_t)(HAL_GetTick()-neoUntil)>=0){neoUntil=0;stateIdle();}
+    audioTick();
+    neoTick();
+    HAL_Delay(1);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief DAC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DAC_Init(void)
+{
+
+  /* USER CODE BEGIN DAC_Init 0 */
+
+  /* USER CODE END DAC_Init 0 */
+
+  DAC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN DAC_Init 1 */
+
+  /* USER CODE END DAC_Init 1 */
+
+  /** DAC Initialization
+  */
+  hdac.Instance = DAC;
+  if (HAL_DAC_Init(&hdac) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** DAC channel OUT1 config
+  */
+  sConfig.DAC_Trigger = DAC_TRIGGER_NONE;
+  sConfig.DAC_OutputBuffer = DAC_OUTPUTBUFFER_ENABLE;
+  if (HAL_DAC_ConfigChannel(&hdac, &sConfig, DAC_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN DAC_Init 2 */
+
+  /* USER CODE END DAC_Init 2 */
+
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 104;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h){
+  if(h->Instance==USART1){diagBytesESP++;ringPush(&fromESP,byteESP);
+    (void)HAL_UART_Receive_IT(&huart1,&byteESP,1);}
+  else if(h->Instance==USART3){diagBytesN2++;ringPush(&fromN2,byteN2);
+    (void)HAL_UART_Receive_IT(&huart3,&byteN2,1);}
+}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *h){
+  if(h->Instance==USART1){(void)HAL_UART_Receive_IT(&huart1,&byteESP,1);}
+  else if(h->Instance==USART3){(void)HAL_UART_Receive_IT(&huart3,&byteN2,1);}
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+
+    __disable_irq();
+
+    while (1)
+    {
+    }
+
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
